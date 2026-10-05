@@ -8,3 +8,11 @@ data/
 runs/
 *.pt
 *.pth
+
+out*.png
+debug/
+binary.png
+
+out*.png
+debug/
+binary.png

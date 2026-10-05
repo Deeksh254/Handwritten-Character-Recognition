@@ -8,6 +8,7 @@ Train:    python -m hcr.crnn --dataset balanced --epochs 10
 Predict:  python -m hcr.crnn --predict word.png --checkpoint runs/crnn/best.pt
 """
 import argparse
+import platform
 from pathlib import Path
 
 import cv2
@@ -19,6 +20,9 @@ from torch.utils.data import DataLoader, Dataset
 from .data import CLASSES, build_dataset
 from .preprocess import load_gray, to_binary
 from .utils import get_device, set_seed
+
+# Windows DataLoader workers deadlock when spawned from a module entry-point.
+_DEFAULT_WORKERS = 0 if platform.system() == "Windows" else 2
 
 
 def trim_columns(img: torch.Tensor) -> torch.Tensor:
@@ -151,7 +155,7 @@ def main():
 
     # ---------- inference ----------
     if args.predict:
-        ckpt = torch.load(args.checkpoint or f"{args.out_dir}/best.pt", map_location=device)
+        ckpt = torch.load(args.checkpoint or f"{args.out_dir}/best.pt", map_location=device, weights_only=False)
         classes = ckpt["classes"]
         model = CRNN(len(classes)).to(device)
         model.load_state_dict(ckpt["model_state"])
@@ -167,8 +171,8 @@ def main():
     base_test = build_dataset(args.dataset, args.data_root, train=False, normalize=False)
     train_ds = SyntheticWords(base_train, args.train_size)
     val_ds = SyntheticWords(base_test, args.val_size, deterministic=True, seed=12345)
-    train_loader = DataLoader(train_ds, args.batch_size, shuffle=True, collate_fn=collate, num_workers=2)
-    val_loader = DataLoader(val_ds, args.batch_size, shuffle=False, collate_fn=collate, num_workers=2)
+    train_loader = DataLoader(train_ds, args.batch_size, shuffle=True, collate_fn=collate, num_workers=_DEFAULT_WORKERS)
+    val_loader = DataLoader(val_ds, args.batch_size, shuffle=False, collate_fn=collate, num_workers=_DEFAULT_WORKERS)
 
     model = CRNN(len(classes)).to(device)
     ctc = nn.CTCLoss(blank=0, zero_infinity=True)

@@ -66,7 +66,7 @@ def main():
     args = p.parse_args()
 
     device = get_device()
-    ckpt = torch.load(args.checkpoint, map_location=device)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     loader, classes = get_test_loader(ckpt["dataset"], args.data_root)
     model = CharCNN(len(classes)).to(device)
     model.load_state_dict(ckpt["model_state"])

@@ -32,10 +32,12 @@ def single_box(binary: np.ndarray):
     return [(x, y, int(xs.max()) - x + 1, int(ys.max()) - y + 1)]
 
 
-def find_boxes(binary: np.ndarray, min_rel_height: float = 0.25):
+def find_boxes(binary: np.ndarray, min_rel_height: float = 0.25) -> list:
     """Segment characters via external contours, sorted left-to-right.
 
     Boxes shorter than min_rel_height * tallest box are treated as noise.
+    After contour detection, overly-wide boxes (likely merged/touching characters)
+    are split using a column-projection valley search.
     """
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     boxes = [cv2.boundingRect(c) for c in contours]
@@ -43,7 +45,104 @@ def find_boxes(binary: np.ndarray, min_rel_height: float = 0.25):
         return []
     tallest = max(b[3] for b in boxes)
     boxes = [b for b in boxes if b[3] >= min_rel_height * tallest]
-    return sorted(boxes, key=lambda b: b[0])
+    boxes = sorted(boxes, key=lambda b: b[0])
+    boxes = split_merged_boxes(binary, boxes)
+    return boxes
+
+
+def split_merged_boxes(binary: np.ndarray, boxes: list, split_ratio: float = 1.6,
+                       min_char_w: int = 6) -> list:
+    """Break boxes that are too wide (likely merged touching characters).
+
+    For each box wider than ``split_ratio × median_width``, we look for
+    ink-free (or near-empty) vertical valleys in the column-projection
+    profile and cut there.  Falls back to an equal split if no valley found.
+    """
+    if len(boxes) < 2:
+        return boxes
+
+    widths = sorted(b[2] for b in boxes)
+    median_w = widths[len(widths) // 2]
+    thresh_w = max(min_char_w * 2, split_ratio * median_w)
+
+    result = []
+    for box in boxes:
+        x, y, w, h = box
+        if w < thresh_w:
+            result.append(box)
+            continue
+
+        # Estimate how many chars are merged
+        n_chars = max(2, round(w / median_w))
+        strip = binary[y: y + h, x: x + w].astype(np.float32)
+        col_proj = strip.sum(axis=0)          # (W,) – ink mass per column
+
+        # Find n_chars-1 valley positions
+        splits = _valley_splits(col_proj, n_chars, min_char_w)
+
+        prev = 0
+        for sp in splits:
+            seg_w = sp - prev
+            if seg_w >= min_char_w:
+                result.append((x + prev, y, seg_w, h))
+            prev = sp
+        tail_w = w - prev
+        if tail_w >= min_char_w:
+            result.append((x + prev, y, tail_w, h))
+
+    return sorted(result, key=lambda b: b[0])
+
+
+def _valley_splits(col_proj: np.ndarray, n_chars: int, min_char_w: int) -> list:
+    """Return n_chars-1 column indices that are ink valleys (best split points)."""
+    w = len(col_proj)
+    splits = []
+    segment_w = w // n_chars
+
+    for k in range(1, n_chars):
+        center = k * w // n_chars
+        half = max(min_char_w, segment_w // 3)
+        lo = max(0, center - half)
+        hi = min(w, center + half)
+        local = col_proj[lo:hi]
+        # Pick the column with the least ink in the local window
+        valley = lo + int(np.argmin(local))
+        splits.append(valley)
+
+    return splits
+
+
+def find_lines(binary: np.ndarray, min_gap_px: int = 4) -> list:
+    """Split a binary image into horizontal text-line strips.
+
+    Uses a horizontal projection profile (row-wise ink sum) to detect
+    text lines separated by blank rows.
+
+    Returns a list of ``(y_start, y_end)`` tuples (row indices into *binary*).
+    """
+    row_sums = binary.sum(axis=1).astype(np.float32)       # shape: (H,)
+    ink_threshold = max(1.0, float(row_sums.max()) * 0.02)
+    in_line = row_sums > ink_threshold
+
+    segments, start = [], None
+    for y, active in enumerate(in_line):
+        if active and start is None:
+            start = y
+        elif not active and start is not None:
+            segments.append([start, y])
+            start = None
+    if start is not None:
+        segments.append([start, int(binary.shape[0])])
+
+    # Merge segments separated by very small gaps (ascenders/descenders)
+    merged = []
+    for seg in segments:
+        if merged and seg[0] - merged[-1][1] <= min_gap_px:
+            merged[-1][1] = seg[1]
+        else:
+            merged.append(seg)
+
+    return [(s, e) for s, e in merged]
 
 
 def box_to_mnist(binary: np.ndarray, box) -> np.ndarray:
