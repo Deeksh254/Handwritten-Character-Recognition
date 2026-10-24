@@ -108,3 +108,47 @@ class CharCNN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.classifier(self.pool(self.features(x)))
+
+
+def _legacy_conv_block(in_ch: int, out_ch: int, dropout: float = 0.1) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(inplace=True),
+        nn.MaxPool2d(2),
+        nn.Dropout2d(dropout),
+    )
+
+
+class LegacyCharCNN(nn.Module):
+    """Original CNN architecture retained for existing checkpoints."""
+
+    def __init__(self, num_classes: int, dropout: float = 0.4):
+        super().__init__()
+        self.features = nn.Sequential(
+            _legacy_conv_block(1, 32),
+            _legacy_conv_block(32, 64),
+            _legacy_conv_block(64, 128),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 3 * 3, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.features(x))
+
+
+def build_model_from_state_dict(num_classes: int, state_dict) -> nn.Module:
+    """Create the CharCNN architecture that matches a saved state dictionary."""
+    if "features.0.main.0.weight" in state_dict:
+        return CharCNN(num_classes)
+    if "features.0.0.weight" in state_dict:
+        return LegacyCharCNN(num_classes)
+    raise ValueError("Unsupported CharCNN checkpoint architecture")

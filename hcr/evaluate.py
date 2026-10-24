@@ -7,10 +7,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from sklearn.metrics import classification_report, confusion_matrix
 
 from .data import get_test_loader
-from .model import CharCNN
+from .metrics import classification_report, confusion_matrix
+from .model import build_model_from_state_dict
 from .utils import get_device
 
 
@@ -47,11 +47,9 @@ def evaluate_model(model, loader, device, classes, out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
     y_true, y_pred = predict_loader(model, loader, device)
     acc = float((y_true == y_pred).mean())
-    labels = list(range(len(classes)))
-    report = classification_report(y_true, y_pred, labels=labels, target_names=classes,
-                                   digits=4, zero_division=0)
+    cm = confusion_matrix(y_true, y_pred, len(classes))
+    report = classification_report(cm, classes)
     (out_dir / "classification_report.txt").write_text(report)
-    cm = confusion_matrix(y_true, y_pred, labels=labels)
     plot_confusion_matrix(cm, classes, out_dir / "confusion_matrix.png")
     print(report)
     print(f"Test accuracy: {acc:.4f}")
@@ -68,7 +66,7 @@ def main():
     device = get_device()
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     loader, classes = get_test_loader(ckpt["dataset"], args.data_root)
-    model = CharCNN(len(classes)).to(device)
+    model = build_model_from_state_dict(len(classes), ckpt["model_state"]).to(device)
     model.load_state_dict(ckpt["model_state"])
     out_dir = args.out_dir or str(Path(args.checkpoint).parent)
     evaluate_model(model, loader, device, classes, out_dir)

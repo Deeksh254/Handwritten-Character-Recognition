@@ -3,23 +3,32 @@
 Recognise handwritten digits and letters using image processing + deep learning.
 
 - **Datasets:** MNIST (digits) and EMNIST (digits, letters, balanced, byclass, bymerge), downloaded automatically by torchvision
-- **Model:** Convolutional Neural Network (3 conv blocks with BatchNorm, Dropout, and an MLP head)
-- **Image processing:** OpenCV pipeline (Gaussian blur, Otsu threshold, contour segmentation, 28x28 normalisation) so the model can read your own photos and scans
-- **Extension:** CRNN (CNN + BiLSTM + CTC) for word / sequence recognition
+- **Model:** SE-ResNet CharCNN (residual blocks, squeeze-excitation, global average pooling)
+- **Single character:** SE-ResNet CharCNN classifies an isolated character and shows its top three raw (uncalibrated) scores
+- **Word, line, and paragraph:** TrOCR `base-handwritten` recognizes line crops without character contour segmentation; paragraphs are deskewed, split into lines, and restored in reading order
+- **Web app:** Gradio UI (`app.py`) — upload, webcam, or draw, then choose the single-character or line-text workflow
+- **Evaluation:** CER/WER evaluation and a manifest-driven TrOCR fine-tuning workflow for labeled line images
 
 ## Project structure
 
 ```
 handwritten-char-recognition/
+├── app.py              # Gradio web demo
+├── smoke_test.py       # quick CNN / legacy CRNN / preprocessing sanity check
 ├── hcr/
 │   ├── data.py         # MNIST/EMNIST loading, orientation fix, train/val/test split
-│   ├── model.py        # CharCNN
+│   ├── model.py        # CharCNN (SE-ResNet)
 │   ├── train.py        # training loop (AdamW + OneCycleLR + augmentation)
 │   ├── evaluate.py     # accuracy, classification report, confusion matrix
+│   ├── metrics.py      # NumPy classification report (no scikit-learn)
 │   ├── preprocess.py   # OpenCV thresholding + character segmentation
-│   ├── predict.py      # inference on your own images (single char or word)
-│   ├── crnn.py         # CRNN + CTC sequence-recognition extension
+│   ├── predict.py      # CharCNN single-character and TrOCR text CLI
+│   ├── htr.py          # TrOCR line crops, page deskew, and line detection
+│   ├── train_htr.py    # fine-tune TrOCR on labeled line images
+│   ├── evaluate_htr.py # real-image CER/WER evaluation
+│   ├── crnn.py         # legacy synthetic CRNN experiment; not used by the app
 │   └── utils.py
+├── samples/runs/       # example training histories and reports
 ├── requirements.txt
 └── README.md
 ```
@@ -54,26 +63,87 @@ Outputs go to `runs/<dataset>/`: `best.pt`, `history.json`, `training_curves.png
 python -m hcr.evaluate --checkpoint runs/balanced/best.pt
 ```
 
-**3. Predict on your own image** (dark ink on light paper; add `--invert` otherwise)
+**3. Recognize an isolated character** with CharCNN (dark ink on light paper; add `--invert` otherwise)
 
 ```bash
-python -m hcr.predict --checkpoint runs/balanced/best.pt --image samples/a.png --mode single
-python -m hcr.predict --checkpoint runs/balanced/best.pt --image samples/hello.png --mode word --save-vis out.png
+python -m hcr.predict --checkpoint samples/runs/byclass/best.pt --image samples/letter.png --mode single --charset uppercase
 ```
 
-`word` mode segments characters with contours and classifies each one. It works for
-well-spaced, non-touching characters.
+Supported single-character alphabets are `any`, `digits`, `uppercase`, and `alphanumeric`.
+The current classifiers have no punctuation classes, so use TrOCR for punctuation-bearing
+text such as email addresses.
 
-**4. Sequence modelling (CRNN)**
+**4. Recognize words, lines, or paragraphs** with pretrained TrOCR. The first use
+downloads the model and processor from Hugging Face; model weights are about 1.33 GB.
 
 ```bash
-python -m hcr.crnn --dataset balanced --epochs 10
-python -m hcr.crnn --predict samples/word.png --checkpoint runs/crnn/best.pt
+python -m hcr.predict --image samples/word.png --mode word --save-vis out_word.png
+python -m hcr.predict --image samples/sentence.png --mode paragraph --save-vis out_page.png
 ```
 
-The CRNN is trained on synthetic words made by stitching EMNIST characters together.
-To recognise real handwritten text (cursive, touching letters), replace `SyntheticWords`
-with a real word-level dataset such as IAM.
+Text modes detect line crops and pass intact grayscale lines to TrOCR; they do not split
+natural handwriting into character contours. Beam alternatives are ranked sequences,
+not confidence estimates. `--checkpoint` is needed only for `--mode single`.
+
+**5. Web app**
+
+```bash
+python app.py              # http://127.0.0.1:7860
+python app.py --share      # also create a temporary public link
+```
+
+The app uses the selected CharCNN checkpoint only for single-character recognition.
+Word, line, and paragraph modes use TrOCR and do not require a CharCNN checkpoint.
+
+**6. Evaluate real handwriting**
+
+```bash
+python -m hcr.evaluate_htr --manifest samples/evaluation/manifest.csv
+```
+
+Create a labeled CSV using `samples/evaluation/manifest.template.csv` as its header:
+`image,reference_text,source,stratum,split,error_stage`. Image paths are relative to the
+CSV. Include at least 50 real examples from each stratum: `clean_scan`, `phone_photo`,
+`low_light`, `cursive`, `paragraph`, and `hard_case` (300 examples total). Evaluation rows
+must use `split=eval`. Attribute observed errors to `capture`, `line_detection`,
+`recognition`, `ordering`, or `post_correction`. Reports include CER, WER, exact match,
+and per-stratum/per-stage results. Do not use training examples for evaluation.
+
+To temperature-calibrate isolated-character scores, prepare a separate CSV with
+`image,label,split`, at least 30 held-out crops with `split=temperature` and another 30
+with `split=threshold`. The sets are kept separate: one fits the temperature and the
+other selects the review threshold. Do not reuse training or text-evaluation images.
+Then run:
+
+```bash
+python -m hcr.calibrate_char --checkpoint samples/runs/byclass/best.pt --manifest data/calibration/characters.csv
+```
+
+This writes a checkpoint sidecar that the app and CLI load automatically. Its threshold
+targets 90% accuracy among accepted calibration examples; this is not a guarantee of
+future accuracy. Without a sidecar, top-three values are reported as uncalibrated raw
+scores. Use the header in `samples/evaluation/char_calibration.template.csv`.
+
+**7. Fine-tune on IAM or consented app samples**
+
+Prepare line images and a CSV containing `image,reference_text,split`, with rows assigned
+to `train` or `val`; paths are relative to the CSV. IAM access and data preparation are
+not bundled. Then run:
+
+```bash
+python -m hcr.train_htr --manifest data/iam/lines.csv --epochs 3 --batch-size 1
+```
+
+Training applies mild rotation, perspective, brightness/contrast, and blur augmentation,
+selects the best checkpoint by validation CER, and records validation CER/WER. The CRNN
+in `hcr/crnn.py` remains only as a legacy synthetic experiment; the app does not use it.
+To use a fine-tuned local checkpoint in the CLI or app, set `HCR_TROCR_MODEL` to its
+directory before launching. In PowerShell:
+
+```powershell
+$env:HCR_TROCR_MODEL = "runs/htr/fine-tuned"
+python app.py --port 7863
+```
 
 ## Typical results
 
@@ -92,11 +162,10 @@ confusion matrix will show errors there. That is expected.
 
 ## Ideas to extend
 
-- Add a Streamlit or Gradio drawing-canvas demo
-- Try ResNet-style blocks or a Vision Transformer and compare
-- Add spell-correction or a language model on top of the CRNN output
-- Train the CRNN on IAM Handwriting Database for real words
+- Try a Vision Transformer and compare against the SE-ResNet CharCNN
+- Add an optional domain lexicon after line-level decoding for constrained fields
+- Expand the consented real-image evaluation set and fine-tune TrOCR on its error cases
 
 ## License
 
-MIT (add a LICENSE file when you create the repo on GitHub).
+MIT. See `LICENSE`.

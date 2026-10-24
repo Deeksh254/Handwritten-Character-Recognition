@@ -108,8 +108,12 @@ def train_epoch(model, loader, criterion, device, optimizer, scheduler,
             scheduler.step()
 
         total_loss += loss.item() * x.size(0)
-        # Accuracy measured on clean (unmixed) labels only
-        correct += (model(x).argmax(1) == y).sum().item()
+        # Accuracy on clean (unmixed) images. eval() so Dropout does not
+        # distort the running metric; the extra pass is not used for learning.
+        model.eval()
+        with torch.no_grad():
+            correct += (model(x).argmax(1) == y).sum().item()
+        model.train()
         n += x.size(0)
 
         if log_every > 0 and i % log_every == 0:
@@ -157,6 +161,11 @@ def plot_history(history: dict, path: Path):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
+    try:
+        import sys
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     args  = parse_args()
     set_seed(args.seed)
     device  = get_device()

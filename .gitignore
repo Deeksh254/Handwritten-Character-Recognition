@@ -4,8 +4,8 @@ __pycache__/
 venv/
 .ipynb_checkpoints/
 .DS_Store
-data/
-runs/
+/data/
+/runs/
 *.pt
 *.pth
 
@@ -13,6 +13,4 @@ out*.png
 debug/
 binary.png
 
-out*.png
-debug/
-binary.png
+*.bak

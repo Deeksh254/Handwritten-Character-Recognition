@@ -50,19 +50,28 @@ def find_boxes(binary: np.ndarray, min_rel_height: float = 0.25) -> list:
     return boxes
 
 
-def split_merged_boxes(binary: np.ndarray, boxes: list, split_ratio: float = 1.6,
+def split_merged_boxes(binary: np.ndarray, boxes: list, split_ratio: float = 1.9,
                        min_char_w: int = 6) -> list:
     """Break boxes that are too wide (likely merged touching characters).
 
-    For each box wider than ``split_ratio × median_width``, we look for
+    For each box wider than ``split_ratio x median_width``, we look for
     ink-free (or near-empty) vertical valleys in the column-projection
     profile and cut there.  Falls back to an equal split if no valley found.
     """
-    if len(boxes) < 2:
+    if not boxes:
         return boxes
 
     widths = sorted(b[2] for b in boxes)
-    median_w = widths[len(widths) // 2]
+    if len(boxes) == 1:
+        # A lone wide blob has no sibling widths to compare against. Use the
+        # character height as a proxy for typical width (handwritten letters
+        # are roughly as wide as they are tall, often a bit narrower).
+        _, _, w0, h0 = boxes[0]
+        median_w = max(min_char_w, int(h0 * 0.65))
+        if w0 < max(min_char_w * 2, split_ratio * median_w):
+            return boxes
+    else:
+        median_w = widths[len(widths) // 2]
     thresh_w = max(min_char_w * 2, split_ratio * median_w)
 
     result = []
@@ -75,7 +84,7 @@ def split_merged_boxes(binary: np.ndarray, boxes: list, split_ratio: float = 1.6
         # Estimate how many chars are merged
         n_chars = max(2, round(w / median_w))
         strip = binary[y: y + h, x: x + w].astype(np.float32)
-        col_proj = strip.sum(axis=0)          # (W,) – ink mass per column
+        col_proj = strip.sum(axis=0)          # (W,) — ink mass per column
 
         # Find n_chars-1 valley positions
         splits = _valley_splits(col_proj, n_chars, min_char_w)
