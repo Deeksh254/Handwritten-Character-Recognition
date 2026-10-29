@@ -4,6 +4,7 @@ Recognise handwritten digits and letters using image processing + deep learning.
 
 - **Datasets:** MNIST (digits) and EMNIST (digits, letters, balanced, byclass, bymerge), downloaded automatically by torchvision
 - **Model:** SE-ResNet CharCNN (residual blocks, squeeze-excitation, global average pooling)
+- **Comparison baseline:** HOG (Histogram of Oriented Gradients) features with a multiclass linear SVM trained on the same MNIST/EMNIST splits
 - **Single character:** SE-ResNet CharCNN classifies an isolated character and shows its top three raw (uncalibrated) scores
 - **Word, line, and paragraph:** TrOCR `base-handwritten` recognizes line crops without character contour segmentation; paragraphs are deskewed, split into lines, and restored in reading order
 - **Web app:** Gradio UI (`app.py`) — upload, webcam, or draw, then choose the single-character or line-text workflow
@@ -20,6 +21,7 @@ handwritten-char-recognition/
 │   ├── model.py        # CharCNN (SE-ResNet)
 │   ├── train.py        # training loop (AdamW + OneCycleLR + augmentation)
 │   ├── evaluate.py     # accuracy, classification report, confusion matrix
+│   ├── train_hog_svm.py # HOG feature extraction and linear SVM benchmark
 │   ├── metrics.py      # NumPy classification report (no scikit-learn)
 │   ├── preprocess.py   # OpenCV thresholding + character segmentation
 │   ├── predict.py      # CharCNN single-character and TrOCR text CLI
@@ -69,13 +71,16 @@ python -m hcr.evaluate --checkpoint runs/balanced/best.pt
 python -m hcr.train_hog_svm --dataset byclass --out-dir runs/benchmarks/hog_svm_byclass
 ```
 
-This extracts 324-dimensional HOG descriptors (9 orientations, 7x7 pixel cells, 2x2-cell
-blocks) and trains an incremental linear SVM with hinge loss on the same torchvision
-EMNIST ByClass train split used by CharCNN. It evaluates on the official test split and
-saves the model, classification report, confusion matrix, and JSON metrics in the
-specified output directory. With the current five-epoch settings, the measured test
-accuracies are 78.83% for HOG + SVM and 87.33% for the existing CharCNN checkpoint, both
-on the same 116,323 test images. These are isolated-character EMNIST results, not
+HOG summarizes local stroke directions into a fixed-length vector for each character;
+the SVM then separates the 62 character classes using a linear decision boundary. This
+baseline uses 324-dimensional HOG descriptors (9 orientations, 7x7 pixel cells, 2x2-cell
+blocks) and an incremental multiclass linear SVM with hinge loss. It trains on the same
+torchvision EMNIST ByClass training split as CharCNN, evaluates on the official test
+split, and saves a joblib model, classification report, confusion matrix, and JSON metrics
+in the specified output directory. With the current five-epoch settings, measured test
+accuracy is 78.83% for HOG + SVM versus 87.33% for the existing CharCNN checkpoint, both
+on the same 116,323 test images. This is a standalone benchmark; the Gradio app continues
+to use CharCNN for isolated characters. These are isolated-character EMNIST results, not
 real-photo accuracy.
 
 **3. Recognize an isolated character** with CharCNN (dark ink on light paper; add `--invert` otherwise)
