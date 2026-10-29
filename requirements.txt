@@ -8,3 +8,5 @@ gradio>=4.44
 transformers>=4.44,<5
 accelerate>=0.28
 jiwer>=3.0,<5
+scikit-image>=0.24
+scikit-learn>=1.4

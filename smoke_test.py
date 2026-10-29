@@ -21,6 +21,7 @@ from hcr.crnn import CRNN, SyntheticWords, collate, greedy_decode
 from hcr.preprocess import to_binary, find_boxes, split_merged_boxes, box_to_mnist
 from hcr.htr import detect_text_lines, image_quality_warnings
 from hcr.calibrate_char import fit_temperature, fit_review_threshold
+from hcr.train_hog_svm import describe_batch, FEATURE_COUNT
 from app import coerce_image
 
 set_seed(42)
@@ -53,6 +54,14 @@ assert coerce_image({"composite": composite}) is composite
 assert coerce_image({"composite": None, "image": composite}) is composite
 print("  legacy checkpoint architecture and Gradio image dict: passed")
 print("COMPATIBILITY PASSED\n")
+
+# ── HOG descriptor ───────────────────────────────────────────────────────────
+print("=== HOG feature pipeline ===")
+hog_features = describe_batch(torch.zeros(2, 1, 28, 28))
+assert hog_features.shape == (2, FEATURE_COUNT), hog_features.shape
+assert np.isfinite(hog_features).all(), "HOG descriptor contains non-finite values"
+print(f"  feature shape={hog_features.shape}")
+print("HOG FEATURES PASSED\n")
 
 # ── CNN ───────────────────────────────────────────────────────────────────────
 print("=== CNN CharCNN pipeline ===")

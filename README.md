@@ -63,6 +63,21 @@ Outputs go to `runs/<dataset>/`: `best.pt`, `history.json`, `training_curves.png
 python -m hcr.evaluate --checkpoint runs/balanced/best.pt
 ```
 
+**Compare HOG + linear SVM against CharCNN**
+
+```bash
+python -m hcr.train_hog_svm --dataset byclass --out-dir runs/benchmarks/hog_svm_byclass
+```
+
+This extracts 324-dimensional HOG descriptors (9 orientations, 7x7 pixel cells, 2x2-cell
+blocks) and trains an incremental linear SVM with hinge loss on the same torchvision
+EMNIST ByClass train split used by CharCNN. It evaluates on the official test split and
+saves the model, classification report, confusion matrix, and JSON metrics in the
+specified output directory. With the current five-epoch settings, the measured test
+accuracies are 78.83% for HOG + SVM and 87.33% for the existing CharCNN checkpoint, both
+on the same 116,323 test images. These are isolated-character EMNIST results, not
+real-photo accuracy.
+
 **3. Recognize an isolated character** with CharCNN (dark ink on light paper; add `--invert` otherwise)
 
 ```bash
