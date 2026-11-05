@@ -3,11 +3,11 @@
 Recognise handwritten digits and letters using image processing + deep learning.
 
 - **Datasets:** MNIST (digits) and EMNIST (digits, letters, balanced, byclass, bymerge), downloaded automatically by torchvision
-- **Model:** SE-ResNet CharCNN (residual blocks, squeeze-excitation, global average pooling)
+- **App model:** One CRNN (CNN + bidirectional GRU + CTC) handles single characters, words/lines, and paragraph line crops
+- **Character baseline:** SE-ResNet CharCNN remains available for isolated-character CLI prediction and comparison
+- **Text baseline:** TrOCR `base-handwritten` remains available for CLI line recognition and comparison
 - **Comparison baseline:** HOG (Histogram of Oriented Gradients) features with a multiclass linear SVM trained on the same MNIST/EMNIST splits
-- **Single character:** SE-ResNet CharCNN classifies an isolated character and shows its top three raw (uncalibrated) scores
-- **Word, line, and paragraph:** TrOCR `base-handwritten` recognizes line crops without character contour segmentation; paragraphs are deskewed, split into lines, and restored in reading order
-- **Web app:** Gradio UI (`app.py`) — upload, webcam, or draw, then choose the single-character or line-text workflow
+- **Web app:** Gradio UI (`app.py`) uses one CRNN checkpoint for every recognition mode
 - **Evaluation:** CER/WER evaluation and a manifest-driven TrOCR fine-tuning workflow for labeled line images
 
 ## Project structure
@@ -15,7 +15,7 @@ Recognise handwritten digits and letters using image processing + deep learning.
 ```
 handwritten-char-recognition/
 ├── app.py              # Gradio web demo
-├── smoke_test.py       # quick CNN / legacy CRNN / preprocessing sanity check
+├── smoke_test.py       # CNN, CRNN, HOG, and preprocessing smoke checks
 ├── hcr/
 │   ├── data.py         # MNIST/EMNIST loading, orientation fix, train/val/test split
 │   ├── model.py        # CharCNN (SE-ResNet)
@@ -28,7 +28,8 @@ handwritten-char-recognition/
 │   ├── htr.py          # TrOCR line crops, page deskew, and line detection
 │   ├── train_htr.py    # fine-tune TrOCR on labeled line images
 │   ├── evaluate_htr.py # real-image CER/WER evaluation
-│   ├── crnn.py         # legacy synthetic CRNN experiment; not used by the app
+│   ├── crnn.py         # CNN + selectable BiLSTM/BiGRU + CTC model
+│   ├── compare_crnn.py # seeded synthetic BiLSTM/BiGRU comparison and real-word examples
 │   └── utils.py
 ├── samples/runs/       # example training histories and reports
 ├── requirements.txt
@@ -65,6 +66,19 @@ Outputs go to `runs/<dataset>/`: `best.pt`, `history.json`, `training_curves.png
 python -m hcr.evaluate --checkpoint runs/balanced/best.pt
 ```
 
+**Train the unified app CRNN**
+
+```bash
+python -m hcr.crnn --dataset balanced --rnn gru --epochs 10 --train-size 5000 --val-size 1000 --out-dir runs/crnn
+```
+
+The app loads `runs/crnn/best.pt` by default; set `HCR_CRNN_CHECKPOINT` to use another
+CRNN checkpoint. The current checkpoint uses a bidirectional GRU and was trained for
+10 epochs on 5,000 synthetic words per epoch. It reached 39.9% exact-match on 1,000
+validation words. On a fixed 512-word synthetic test set it scored 17.78% CER, 58.59%
+WER, and 41.41% exact match. These results are synthetic: the sequences are stitched
+from EMNIST characters, not natural word-level handwriting.
+
 **Compare HOG + linear SVM against CharCNN**
 
 ```bash
@@ -79,11 +93,11 @@ torchvision EMNIST ByClass training split as CharCNN, evaluates on the official 
 split, and saves a joblib model, classification report, confusion matrix, and JSON metrics
 in the specified output directory. With the current five-epoch settings, measured test
 accuracy is 78.83% for HOG + SVM versus 87.33% for the existing CharCNN checkpoint, both
-on the same 116,323 test images. This is a standalone benchmark; the Gradio app continues
-to use CharCNN for isolated characters. These are isolated-character EMNIST results, not
+on the same 116,323 test images. This is a standalone benchmark; the Gradio app uses the
+unified CRNN instead. These are isolated-character EMNIST results, not
 real-photo accuracy.
 
-**3. Recognize an isolated character** with CharCNN (dark ink on light paper; add `--invert` otherwise)
+**3. Recognize an isolated character** with the CharCNN CLI baseline (dark ink on light paper; add `--invert` otherwise)
 
 ```bash
 python -m hcr.predict --checkpoint samples/runs/byclass/best.pt --image samples/letter.png --mode single --charset uppercase
@@ -93,7 +107,7 @@ Supported single-character alphabets are `any`, `digits`, `uppercase`, and `alph
 The current classifiers have no punctuation classes, so use TrOCR for punctuation-bearing
 text such as email addresses.
 
-**4. Recognize words, lines, or paragraphs** with pretrained TrOCR. The first use
+**4. Recognize words, lines, or paragraphs** with the separate pretrained TrOCR CLI baseline. The first use
 downloads the model and processor from Hugging Face; model weights are about 1.33 GB.
 
 ```bash
@@ -105,6 +119,37 @@ Text modes detect line crops and pass intact grayscale lines to TrOCR; they do n
 natural handwriting into character contours. Beam alternatives are ranked sequences,
 not confidence estimates. `--checkpoint` is needed only for `--mode single`.
 
+**Compare synthetic BiLSTM-CTC and BiGRU-CTC**
+
+```bash
+python -m hcr.compare_crnn --dataset balanced --train-size 1024 --validation-size 256 --test-size 512 --epochs 3 --seed 42
+```
+
+The runner creates deterministic synthetic words once and trains both recurrent types
+with the same seed, data order, and epoch count. It reports synthetic-test CER, WER, and
+exact match, then compares predictions on `samples/word.png` (`Dee`) and
+`samples/mixed.png` (`B8Cd7`) against contour+CNN and TrOCR. Results from the 3-epoch
+CPU run:
+
+Each synthetic sample is one space-free random character string, so synthetic WER is
+effectively a whole-string exact-match error rate; it is not natural-language sentence WER.
+
+| Model | Synthetic test CER | Synthetic test WER | Exact match |
+|---|---:|---:|---:|
+| BiLSTM-CTC | 100.00% | 100.00% | 0.00% |
+| BiGRU-CTC | 97.31% | 100.00% | 0.00% |
+
+Real-image outputs (two examples only; qualitative, not a representative accuracy set):
+
+| Image (reference) | BiLSTM-CTC | BiGRU-CTC | Contour + CNN | TrOCR |
+|---|---|---|---|---|
+| `word.png` (`Dee`) | (empty) | (empty) | `Dee` | `De e` |
+| `mixed.png` (`B8Cd7`) | (empty) | (empty) | `B8Cd7` | `B8cd7` |
+
+At this small training budget neither CRNN learned useful word decoding; treat this as
+an architecture smoke comparison, not a competitive accuracy claim. Outputs, separate
+CRNN checkpoints, and row-level real predictions go to `runs/benchmarks/crnn_comparison/`.
+
 **5. Web app**
 
 ```bash
@@ -112,8 +157,9 @@ python app.py              # http://127.0.0.1:7860
 python app.py --share      # also create a temporary public link
 ```
 
-The app uses the selected CharCNN checkpoint only for single-character recognition.
-Word, line, and paragraph modes use TrOCR and do not require a CharCNN checkpoint.
+All app modes use the same CRNN checkpoint: single-character input is treated as a
+one-character sequence, and text input is detected as lines before CTC decoding. The
+CharCNN and TrOCR paths remain available only through their separate CLI/benchmark tools.
 
 **6. Evaluate real handwriting**
 
@@ -139,10 +185,11 @@ Then run:
 python -m hcr.calibrate_char --checkpoint samples/runs/byclass/best.pt --manifest data/calibration/characters.csv
 ```
 
-This writes a checkpoint sidecar that the app and CLI load automatically. Its threshold
-targets 90% accuracy among accepted calibration examples; this is not a guarantee of
-future accuracy. Without a sidecar, top-three values are reported as uncalibrated raw
-scores. Use the header in `samples/evaluation/char_calibration.template.csv`.
+This writes a checkpoint sidecar that CharCNN CLI prediction loads automatically; the
+CRNN-only web app does not use this calibration. Its threshold targets 90% accuracy among
+accepted calibration examples; this is not a guarantee of future accuracy. Without a
+sidecar, top-three values are reported as uncalibrated raw scores. Use the header in
+`samples/evaluation/char_calibration.template.csv`.
 
 **7. Fine-tune on IAM or consented app samples**
 
@@ -155,13 +202,15 @@ python -m hcr.train_htr --manifest data/iam/lines.csv --epochs 3 --batch-size 1
 ```
 
 Training applies mild rotation, perspective, brightness/contrast, and blur augmentation,
-selects the best checkpoint by validation CER, and records validation CER/WER. The CRNN
-in `hcr/crnn.py` remains only as a legacy synthetic experiment; the app does not use it.
-To use a fine-tuned local checkpoint in the CLI or app, set `HCR_TROCR_MODEL` to its
-directory before launching. In PowerShell:
+selects the best checkpoint by validation CER, and records validation CER/WER. This is
+the optional TrOCR CLI fine-tuning path; it does not change the CRNN-only app. To select a
+fine-tuned TrOCR model in the CLI, set `HCR_TROCR_MODEL` before running prediction. To
+select a different CRNN checkpoint in the app, set `HCR_CRNN_CHECKPOINT`. In PowerShell:
 
 ```powershell
 $env:HCR_TROCR_MODEL = "runs/htr/fine-tuned"
+$env:HCR_CRNN_CHECKPOINT = "runs/crnn/best.pt"
+python -m hcr.predict --image samples/word.png --mode word
 python app.py --port 7863
 ```
 

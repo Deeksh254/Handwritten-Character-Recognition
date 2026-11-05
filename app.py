@@ -8,74 +8,41 @@ Models are loaded from runs/<name>/best.pt automatically.
 """
 import argparse
 import os
-import string
 import traceback
 from pathlib import Path
 
 import cv2
 import gradio as gr
 import numpy as np
+import torch
 
 ROOT = Path(__file__).resolve().parent
 os.chdir(ROOT)
 
-from hcr.predict import (
-    classify_topk, load_model,
-    draw_details,
-)
-from hcr.preprocess import box_to_mnist, single_box, to_binary
-from hcr.htr import DEFAULT_MODEL_ID, image_quality_warnings, recognize_handwriting
+from hcr.crnn import CRNN, greedy_decode, line_image_to_tensor
+from hcr.htr import detect_text_lines, image_quality_warnings
+from hcr.preprocess import single_box, to_binary
 from hcr.utils import get_device
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Global state
 # ──────────────────────────────────────────────────────────────────────────────
 DEVICE = get_device()
-HTR_MODEL_ID = DEFAULT_MODEL_ID
-_MODEL_CACHE: dict = {}
-
-FRIENDLY_NAMES = {
-    "byclass":  "All Characters (0-9, A-Z, a-z) · 62 classes",
-    "balanced": "Balanced (0-9, A-Z, common) · 47 classes",
-    "letters":  "Letters Only (A-Z) · 26 classes",
-    "digits":   "Digits Only (0-9) · 10 classes",
-    "mnist":    "MNIST Digits (0-9) · 10 classes",
-}
+_checkpoint_setting = Path(os.environ.get("HCR_CRNN_CHECKPOINT", "runs/crnn/best.pt"))
+CRNN_CHECKPOINT = _checkpoint_setting if _checkpoint_setting.is_absolute() else ROOT / _checkpoint_setting
+_CRNN_CACHE = None
 
 
-def find_models() -> dict:
-    """Scan bundled and local model directories for trained checkpoints."""
-    found = {}
-    checkpoint_paths = sorted((ROOT / "samples" / "runs").glob("*/best.pt"))
-    checkpoint_paths += sorted((ROOT / "runs").glob("*/best.pt"))
-    for p in checkpoint_paths:
-        name = p.parent.name
-        if name in ("crnn", "smoke_test"):
-            continue
-        label = FRIENDLY_NAMES.get(name, name)
-        found[label] = str(p)
-    models_dir = ROOT / "models"
-    if models_dir.exists():
-        for p in sorted(models_dir.glob("*.pt")):
-            found[p.stem] = str(p)
-    return found
-
-
-MODELS = find_models()
-MODEL_LABELS = list(MODELS.keys())
-DEFAULT_MODEL = next(
-    (label for label, path in MODELS.items() if Path(path).parent.name == "byclass"),
-    next(
-        (label for label, path in MODELS.items() if Path(path).parent.name == "balanced"),
-        MODEL_LABELS[0] if MODEL_LABELS else None,
-    ),
-)
-
-
-def get_model(label: str):
-    if label not in _MODEL_CACHE:
-        _MODEL_CACHE[label] = load_model(MODELS[label], DEVICE)
-    return _MODEL_CACHE[label]
+def get_crnn():
+    global _CRNN_CACHE
+    if _CRNN_CACHE is None:
+        checkpoint = torch.load(CRNN_CHECKPOINT, map_location=DEVICE, weights_only=False)
+        classes = checkpoint["classes"]
+        model = CRNN(len(classes), rnn_type=checkpoint.get("rnn_type", "lstm")).to(DEVICE)
+        model.load_state_dict(checkpoint["model_state"])
+        model.eval()
+        _CRNN_CACHE = (model, classes)
+    return _CRNN_CACHE
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -122,11 +89,9 @@ def numpy_to_gray(image: np.ndarray, max_side: int = 1600) -> np.ndarray:
 def recognise(
     image: np.ndarray,
     sketch,
-    model_label: str,
     mode: str,
     invert: bool,
     dilate_val: int,
-    allowed_charset: str = "Any class",
 ):
     """Main recognition pipeline — called by the Gradio button."""
     image = coerce_image(image)
@@ -135,72 +100,60 @@ def recognise(
     # ── Validation ─────────────────────────────────────────────────────────
     if image is None:
         return None, "", "⚠️ Please upload or draw an image first."
+    if not CRNN_CHECKPOINT.exists():
+        return None, "", (
+            f"CRNN checkpoint not found: {CRNN_CHECKPOINT}\n"
+            "Train the unified recognizer with:\n"
+            "python -m hcr.crnn --dataset balanced --rnn gru --epochs 10 --out-dir runs/crnn"
+        )
     try:
         gray   = numpy_to_gray(image)
         mode_key = mode.lower()
+        model, classes = get_crnn()
 
         if mode_key == "single character":
-            if not MODELS:
-                return None, "", "No single-character checkpoints found."
-            if not model_label or model_label not in MODELS:
-                return None, "", "Select a model for single-character recognition."
-            model, classes = get_model(model_label)
             binary = to_binary(gray, invert=invert, dilate=dilate_val)
             boxes = single_box(binary)
             if not boxes:
                 return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB), "", "No character detected."
-            allowed_labels = {
-                "Digits only": set(string.digits),
-                "Uppercase only": set(string.ascii_uppercase),
-                "Letters and digits": set(string.ascii_letters + string.digits),
-            }.get(allowed_charset)
-            top = classify_topk(
-                model, box_to_mnist(binary, boxes[0]), DEVICE, classes,
-                allowed_labels=allowed_labels,
-            )
-            text = classes[top[0][0]]
-            details = [(text, top[0][1], boxes[0])]
-            if not details:
-                return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB), "", "No character detected."
-
-            char_box = details[0][2]
-            alternatives = ", ".join(f"{classes[index]} {score:.0%}" for index, score in top)
-            scores_are_calibrated = model.is_temperature_calibrated and allowed_labels is None
-            score_label = (
-                "Top guesses (temperature-scaled probabilities)"
-                if scores_are_calibrated
-                else "Top guesses (raw, uncalibrated scores)"
-            )
-            note_lines = [
-                f"Character model: {model_label.split('·')[0].strip()}",
-                f"{score_label}: {alternatives}",
-            ]
-            if not scores_are_calibrated:
-                note_lines.append("Scores are not calibrated confidence estimates.")
-            elif top[0][1] < model.review_threshold:
-                note_lines.append("Review needed: top calibrated probability is below the held-out threshold.")
-            if allowed_labels is not None:
-                note_lines.append(f"Alphabet constraint: {allowed_charset}.")
             vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-            draw_details(vis, details, font_scale=max(0.5, gray.shape[0] / 900))
-            return cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), text, "\n".join(note_lines)
+            x, y, width, height = boxes[0]
+            crop = gray[y:y + height, x:x + width]
+            input_tensor = line_image_to_tensor(
+                crop, dilate=dilate_val, invert=invert
+            ).to(DEVICE)
+            with torch.inference_mode():
+                text = greedy_decode(model(input_tensor), classes)[0]
+            cv2.rectangle(vis, (x, y), (x + width, y + height), (0, 210, 0), 2)
+            cv2.putText(vis, text or "?", (x, max(16, y - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60, 60, 220), 2, cv2.LINE_AA)
+            note = "Single character decoded by the CRNN (CNN + BiGRU/LSTM + CTC)."
+            if not text:
+                note += " The model emitted only CTC blanks; retraining or a clearer sample may help."
+            return cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), text, note
 
-        page, line_results = recognize_handwriting(
-            gray, invert=invert, model_id=HTR_MODEL_ID
-        )
-        if not line_results:
+        page, line_boxes = detect_text_lines(gray, invert=invert)
+        if not line_boxes:
             return cv2.cvtColor(page, cv2.COLOR_GRAY2RGB), "", "No text lines detected."
 
-        text = "\n".join(primary for primary, _, _ in line_results)
         vis = cv2.cvtColor(page, cv2.COLOR_GRAY2BGR)
-        note_lines = [f"TrOCR line recognizer: {len(line_results)} line(s)."]
+        line_texts, note_lines = [], [
+            f"CRNN line recognizer: {len(line_boxes)} line(s), "
+            f"{model.rnn_type.upper()} + CTC."
+        ]
         note_lines.extend(image_quality_warnings(gray))
-        for index, (primary, hypotheses, (x, y, width, height)) in enumerate(line_results, 1):
-            cv2.rectangle(vis, (x, y), (x + width, y + height), (0, 210, 0), 2)
-            cv2.putText(vis, f"Line {index}", (x, max(16, y - 5)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (60, 60, 220), 2, cv2.LINE_AA)
-            alternatives = " | ".join(hypotheses[:3])
-            note_lines.append(f"Line {index} alternatives (beam order, not confidence): {alternatives}")
+        with torch.inference_mode():
+            for index, (x, y, width, height) in enumerate(line_boxes, 1):
+                crop = page[y:y + height, x:x + width]
+                input_tensor = line_image_to_tensor(crop, dilate=dilate_val).to(DEVICE)
+                line_text = greedy_decode(model(input_tensor), classes)[0]
+                line_texts.append(line_text)
+                cv2.rectangle(vis, (x, y), (x + width, y + height), (0, 210, 0), 2)
+                cv2.putText(vis, f"Line {index}", (x, max(16, y - 5)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (60, 60, 220), 2, cv2.LINE_AA)
+                if not line_text:
+                    note_lines.append(f"Line {index}: CRNN emitted only blanks.")
+        text = "\n".join(line_texts)
         return cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), text, "\n".join(note_lines)
 
     except Exception as exc:
@@ -421,14 +374,10 @@ def build_ui() -> gr.Blocks:
         </div>
         """)
 
-        # ── Model info banner ───────────────────────────────────────────────
-        if MODEL_LABELS:
-            badges = "".join(
-                f'<span class="stat-badge">{lbl.split("·")[0].strip()}</span>'
-                for lbl in MODEL_LABELS
-            )
+        # ── CRNN checkpoint status ─────────────────────────────────────────
+        if CRNN_CHECKPOINT.exists():
             gr.HTML(f'<div style="text-align:center;margin-bottom:1rem">'
-                    f'Available models: {badges}</div>')
+                    f'Unified recognizer: CNN + bidirectional recurrent layer + CTC</div>')
         else:
             gr.HTML("""
             <div style="
@@ -438,10 +387,10 @@ def build_ui() -> gr.Blocks:
                 border-radius:12px; padding:1rem;
                 color:#fca5a5;
             ">
-                <b>⚠️ No trained models found.</b><br>
+                <b>⚠️ CRNN checkpoint not found.</b><br>
                 <span style="font-size:0.88rem;color:#94a3b8">
-                    Run in a terminal: <code style="color:#a78bfa">python -m hcr.train --dataset byclass --epochs 25</code><br>
-                    then restart the app once training completes.
+                    Train the unified model with <code style="color:#a78bfa">python -m hcr.crnn --dataset balanced --rnn gru --epochs 10 --out-dir runs/crnn</code><br>
+                    then restart the app.
                 </span>
             </div>
             """)
@@ -478,23 +427,11 @@ def build_ui() -> gr.Blocks:
                                 )
 
                 with gr.Group(elem_classes="glass-card"):
-                    model_dd = gr.Dropdown(
-                        choices=MODEL_LABELS,
-                        value=DEFAULT_MODEL,
-                        label="🤖 Single-Character Model",
-                        info="Used only for isolated-character recognition",
-                    )
                     mode_radio = gr.Radio(
                         choices=["Single Character", "Word / Line", "Paragraph / Page"],
                         value="Single Character",
                         label="📝 Recognition Mode",
-                        info="Text modes use TrOCR and download about 1.33 GB on first use.",
-                    )
-                    charset_dd = gr.Dropdown(
-                        choices=["Any class", "Digits only", "Uppercase only", "Letters and digits"],
-                        value="Any class",
-                        label="Single-Character Alphabet",
-                        info="Applied only in Single Character mode",
+                        info="All modes use the same CRNN checkpoint.",
                     )
 
                 with gr.Accordion("⚙️ Advanced Options", open=False):
@@ -570,7 +507,7 @@ def build_ui() -> gr.Blocks:
         """)
 
         # ── Wiring ──────────────────────────────────────────────────────────
-        inputs  = [img_input, sketch_input, model_dd, mode_radio, invert_cb, dilate_sl, charset_dd]
+        inputs  = [img_input, sketch_input, mode_radio, invert_cb, dilate_sl]
         outputs = [vis_output, txt_output, note_output]
 
         run_btn.click(fn=recognise, inputs=inputs, outputs=outputs)
@@ -604,13 +541,12 @@ if __name__ == "__main__":
     p.add_argument("--host",   default="127.0.0.1")
     args = p.parse_args()
 
-    if not MODELS:
+    if not CRNN_CHECKPOINT.exists():
         print(
-            "⚠️  No trained models found yet.\n"
-            "Train one with:\n"
-            "  python -m hcr.train --dataset byclass --epochs 25\n"
-            "  python -m hcr.train --dataset letters --epochs 15\n"
-            "The app will launch anyway — restart it after training to load a model."
+            f"CRNN checkpoint not found: {CRNN_CHECKPOINT}\n"
+            "Train the app recognizer with:\n"
+            "  python -m hcr.crnn --dataset balanced --rnn gru --epochs 10 --out-dir runs/crnn\n"
+            "The app will launch, but predictions will be unavailable until training completes."
         )
 
     try:
@@ -618,7 +554,7 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
-    print(f"[OK] Found {len(MODELS)} model(s): {', '.join(MODEL_LABELS)}")
+    print(f"[OK] CRNN checkpoint: {CRNN_CHECKPOINT}")
     print(f"[>>] Launching on http://{args.host}:{args.port}")
 
     build_ui().launch(

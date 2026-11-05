@@ -1,10 +1,10 @@
-"""CRNN (CNN + BiLSTM + CTC) extension: recognise whole words / sequences.
+"""CRNN (CNN + bidirectional LSTM/GRU + CTC) for words and character sequences.
 
 There is no handwritten *word* dataset bundled with torchvision, so this script builds
 synthetic "words" by stitching random EMNIST characters side by side. It demonstrates the
 sequence-modelling pipeline; swap SyntheticWords for IAM (or any word dataset) for real text.
 
-Train:    python -m hcr.crnn --dataset balanced --epochs 10
+Train:    python -m hcr.crnn --dataset balanced --rnn gru --epochs 10
 Predict:  python -m hcr.crnn --predict word.png --checkpoint runs/crnn/best.pt
 """
 import argparse
@@ -67,8 +67,12 @@ def collate(batch):
 
 
 class CRNN(nn.Module):
-    def __init__(self, num_classes: int, hidden: int = 128):
+    def __init__(self, num_classes: int, hidden: int = 128, rnn_type: str = "gru"):
         super().__init__()
+        if rnn_type not in {"lstm", "gru"}:
+            raise ValueError(f"Unsupported recurrent layer: {rnn_type}")
+        recurrent_layer = nn.GRU if rnn_type == "gru" else nn.LSTM
+        self.rnn_type = rnn_type
         self.cnn = nn.Sequential(
             nn.Conv2d(1, 64, 3, padding=1), nn.ReLU(True), nn.MaxPool2d(2, 2),        # 14 x W/2
             nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(True), nn.MaxPool2d(2, 2),      # 7 x W/4
@@ -77,8 +81,8 @@ class CRNN(nn.Module):
             nn.Conv2d(256, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(True),
             nn.MaxPool2d((3, 1)),                                                     # 1 x W/4
         )
-        self.rnn = nn.LSTM(256, hidden, num_layers=2, bidirectional=True,
-                           batch_first=True, dropout=0.2)
+        self.rnn = recurrent_layer(256, hidden, num_layers=2, bidirectional=True,
+                      batch_first=True, dropout=0.2)
         self.fc = nn.Linear(hidden * 2, num_classes + 1)  # +1 for CTC blank at index 0
 
     def forward(self, x):                       # x: (B, 1, 28, W)
@@ -134,6 +138,26 @@ def word_image_to_tensor(path: str, width: int, invert: bool = False) -> torch.T
     return torch.from_numpy(canvas).float().div(255).unsqueeze(0).unsqueeze(0)
 
 
+def line_image_to_tensor(image: np.ndarray, dilate: int = 1,
+                         invert: bool = False) -> torch.Tensor:
+    """Normalize a grayscale line crop to (1, 1, 28, W), preserving its width."""
+    gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    binary = to_binary(gray, invert=invert, dilate=dilate)
+    ys, xs = np.nonzero(binary)
+    if not len(xs):
+        return torch.zeros(1, 1, 28, 4)
+
+    crop = binary[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    height, width = crop.shape
+    new_width = max(1, round(width * 20 / height))
+    resized = cv2.resize(crop, (new_width, 20), interpolation=cv2.INTER_AREA)
+    canvas_width = max(28, ((new_width + 11) // 4) * 4)
+    canvas = np.zeros((28, canvas_width), dtype=np.uint8)
+    x0 = (canvas_width - new_width) // 2
+    canvas[4:24, x0:x0 + new_width] = resized
+    return torch.from_numpy(canvas).float().div(255).unsqueeze(0).unsqueeze(0)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", default="balanced", choices=["balanced", "byclass", "bymerge", "letters", "digits"])
@@ -141,6 +165,8 @@ def main():
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--rnn", choices=["lstm", "gru"], default="gru",
+                   help="Bidirectional recurrent layer. Existing checkpoints default to LSTM when loading.")
     p.add_argument("--train-size", type=int, default=50000, help="synthetic words per epoch")
     p.add_argument("--val-size", type=int, default=5000)
     p.add_argument("--out-dir", default="runs/crnn")
@@ -157,7 +183,7 @@ def main():
     if args.predict:
         ckpt = torch.load(args.checkpoint or f"{args.out_dir}/best.pt", map_location=device, weights_only=False)
         classes = ckpt["classes"]
-        model = CRNN(len(classes)).to(device)
+        model = CRNN(len(classes), rnn_type=ckpt.get("rnn_type", "lstm")).to(device)
         model.load_state_dict(ckpt["model_state"])
         model.eval()
         x = word_image_to_tensor(args.predict, ckpt["width"], args.invert).to(device)
@@ -169,12 +195,13 @@ def main():
     classes = CLASSES[args.dataset]
     base_train = build_dataset(args.dataset, args.data_root, train=True, normalize=False)
     base_test = build_dataset(args.dataset, args.data_root, train=False, normalize=False)
-    train_ds = SyntheticWords(base_train, args.train_size)
+    train_ds = SyntheticWords(base_train, args.train_size,
+                              deterministic=True, seed=args.seed)
     val_ds = SyntheticWords(base_test, args.val_size, deterministic=True, seed=12345)
     train_loader = DataLoader(train_ds, args.batch_size, shuffle=True, collate_fn=collate, num_workers=_DEFAULT_WORKERS)
     val_loader = DataLoader(val_ds, args.batch_size, shuffle=False, collate_fn=collate, num_workers=_DEFAULT_WORKERS)
 
-    model = CRNN(len(classes)).to(device)
+    model = CRNN(len(classes), rnn_type=args.rnn).to(device)
     ctc = nn.CTCLoss(blank=0, zero_infinity=True)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     T = train_ds.width // 4
@@ -201,6 +228,7 @@ def main():
         if acc > best:
             best = acc
             torch.save({"model_state": model.state_dict(), "classes": classes,
+                        "rnn_type": model.rnn_type,
                         "width": train_ds.width, "dataset": args.dataset}, out_dir / "best.pt")
 
     print(f"Best validation exact-match accuracy: {best:.4f}")

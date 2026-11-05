@@ -96,6 +96,12 @@ base_tr = build_dataset("balanced", "data", train=True, normalize=False)
 base_va = build_dataset("balanced", "data", train=False, normalize=False)
 cc = CLASSES["balanced"]
 
+for recurrent_type in ("lstm", "gru"):
+    recurrent_model = CRNN(len(cc), rnn_type=recurrent_type).to(device)
+    logits = recurrent_model(torch.zeros(2, 1, 28, 192, device=device))
+    assert logits.shape == (2, 48, len(cc) + 1), logits.shape
+print("BiLSTM and BiGRU CTC dimensions PASSED")
+
 ds_tr = SyntheticWords(base_tr, 256)
 ds_va = SyntheticWords(base_va, 64, deterministic=True, seed=99)
 tl = DataLoader(ds_tr, 32, shuffle=True,  collate_fn=collate, num_workers=0)
